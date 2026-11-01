@@ -46,6 +46,10 @@ def _b64decode(segment):
 
 def decode_jwt_header(jwt):
     try:
+        # Decoding indexes segments without counting them first. A two
+        # segment string decodes and gets a full analysis below even though
+        # verify_signature refuses it for lacking a signature segment, and a
+        # four segment string is analyzed on its first two segments only.
         header_encoded = jwt.split(".")[0]
         header_decoded = _b64decode(header_encoded).decode('utf-8')
         return json.loads(header_decoded)
@@ -100,6 +104,10 @@ def analyze_jwt(jwt):
     now = time.time()
     if "exp" not in payload:
         results["payload_analysis"].append("Warning: 'exp' (expiration time) claim is missing. JWT might not expire.")
+    # A non numeric exp falls through with no finding at all, so a token
+    # carrying exp as a string is reported as neither expired nor
+    # unexpired. JSON true also passes this test, since bool is an int
+    # subclass, and is compared against the clock as the number 1.
     elif isinstance(payload["exp"], (int, float)):
         if payload["exp"] < now:
             results["payload_analysis"].append("Warning: Token is expired: the 'exp' claim is in the past.")
@@ -161,6 +169,9 @@ def print_analysis_results(results, show_payload_values=False):
     print("---------------- JWT Analysis Report ----------------")
     if "header" in results:
         print("\nHeader:")
+        # The header prints in full, including any kid or embedded key
+        # material a token carries, while payload values below are masked by
+        # default. The two halves of the same token get opposite treatment.
         print(json.dumps(results["header"], indent=4))
     if "payload" in results:
         print("\nPayload (claim names and value types; values masked unless --show-payload-values was given):")
@@ -194,6 +205,9 @@ def load_candidates(args):
         try:
             with open(args.secret_file, "r") as f:
                 for line in f:
+                    # Only the newline is stripped. A secret file saved with CRLF line
+                    # endings leaves a carriage return on every candidate, and none of
+                    # them will ever verify, with no hint in the output about why.
                     line = line.rstrip("\n")
                     if line:
                         candidates.append(line)
