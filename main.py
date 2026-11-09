@@ -26,6 +26,11 @@ class JWTAnalysisError(Exception):
     pass
 
 
+def _is_numeric_date(value):
+    """True for a JSON NumericDate: an int or float, but not a bool."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def setup_argparse():
     """Sets up the argument parser for the CLI."""
     parser = argparse.ArgumentParser(description="Analyzes JWT (JSON Web Tokens) for common vulnerabilities.")
@@ -44,13 +49,17 @@ def _b64decode(segment):
     return base64.urlsafe_b64decode(segment + '=' * (-len(segment) % 4))
 
 
+def _segments(jwt):
+    parts = jwt.split(".")
+    if len(parts) != 3:
+        raise JWTAnalysisError(
+            f"Token must have exactly three segments (header, payload, signature); found {len(parts)}.")
+    return parts
+
+
 def decode_jwt_header(jwt):
     try:
-        # Decoding indexes segments without counting them first. A two
-        # segment string decodes and gets a full analysis below even though
-        # verify_signature refuses it for lacking a signature segment, and a
-        # four segment string is analyzed on its first two segments only.
-        header_encoded = jwt.split(".")[0]
+        header_encoded = _segments(jwt)[0]
         header_decoded = _b64decode(header_encoded).decode('utf-8')
         return json.loads(header_decoded)
     except (IndexError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error, ValueError) as e:
@@ -59,7 +68,7 @@ def decode_jwt_header(jwt):
 
 def decode_jwt_payload(jwt):
     try:
-        payload_encoded = jwt.split(".")[1]
+        payload_encoded = _segments(jwt)[1]
         payload_decoded = _b64decode(payload_encoded).decode('utf-8')
         return json.loads(payload_decoded)
     except (IndexError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error, ValueError) as e:
@@ -104,24 +113,24 @@ def analyze_jwt(jwt):
     now = time.time()
     if "exp" not in payload:
         results["payload_analysis"].append("Warning: 'exp' (expiration time) claim is missing. JWT might not expire.")
-    # A non numeric exp falls through with no finding at all, so a token
-    # carrying exp as a string is reported as neither expired nor
-    # unexpired. JSON true also passes this test, since bool is an int
-    # subclass, and is compared against the clock as the number 1.
-    elif isinstance(payload["exp"], (int, float)):
-        if payload["exp"] < now:
-            results["payload_analysis"].append("Warning: Token is expired: the 'exp' claim is in the past.")
-        else:
-            results["payload_analysis"].append("Info: Token is not expired: the 'exp' claim is in the future.")
+    elif not _is_numeric_date(payload["exp"]):
+        results["payload_analysis"].append("Warning: 'exp' claim is not a number, so its expiration cannot be evaluated. A NumericDate is required.")
+    elif payload["exp"] < now:
+        results["payload_analysis"].append("Warning: Token is expired: the 'exp' claim is in the past.")
+    else:
+        results["payload_analysis"].append("Info: Token is not expired: the 'exp' claim is in the future.")
 
     if "iat" not in payload:
         results["payload_analysis"].append("Warning: 'iat' (issued at) claim is missing.")
+    elif not _is_numeric_date(payload["iat"]):
+        results["payload_analysis"].append("Warning: 'iat' claim is not a number. A NumericDate is required.")
 
     if "nbf" not in payload:
         results["payload_analysis"].append("Warning: 'nbf' (not before) claim is missing.")
-    elif isinstance(payload["nbf"], (int, float)):
-        if payload["nbf"] > now:
-            results["payload_analysis"].append("Warning: Token is not yet valid: the 'nbf' claim is in the future.")
+    elif not _is_numeric_date(payload["nbf"]):
+        results["payload_analysis"].append("Warning: 'nbf' claim is not a number, so its validity window cannot be evaluated. A NumericDate is required.")
+    elif payload["nbf"] > now:
+        results["payload_analysis"].append("Warning: Token is not yet valid: the 'nbf' claim is in the future.")
 
     return results
 
@@ -169,10 +178,9 @@ def print_analysis_results(results, show_payload_values=False):
     print("---------------- JWT Analysis Report ----------------")
     if "header" in results:
         print("\nHeader:")
-        # The header prints in full, including any kid or embedded key
-        # material a token carries, while payload values below are masked by
-        # default. The two halves of the same token get opposite treatment.
-        print(json.dumps(results["header"], indent=4))
+        # An embedded JWK can carry key material, so it is never printed;
+        # the rest of the header is metadata and is shown as decoded.
+        print(json.dumps(_redact_header(results["header"]), indent=4))
     if "payload" in results:
         print("\nPayload (claim names and value types; values masked unless --show-payload-values was given):")
         masked = {}
@@ -199,16 +207,22 @@ def print_analysis_results(results, show_payload_values=False):
     print("-----------------------------------------------------")
 
 
+def _redact_header(header):
+    redacted = dict(header)
+    if "jwk" in redacted:
+        redacted["jwk"] = "<masked: embedded JWK not shown>"
+    return redacted
+
+
 def load_candidates(args):
     candidates = list(args.secret)
     if args.secret_file:
         try:
             with open(args.secret_file, "r") as f:
                 for line in f:
-                    # Only the newline is stripped. A secret file saved with CRLF line
-                    # endings leaves a carriage return on every candidate, and none of
-                    # them will ever verify, with no hint in the output about why.
-                    line = line.rstrip("\n")
+                    # Strip both CR and LF so candidates never carry a
+                    # line ending character into the HMAC input.
+                    line = line.rstrip("\r\n")
                     if line:
                         candidates.append(line)
         except OSError as e:
